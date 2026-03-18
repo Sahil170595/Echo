@@ -1,0 +1,25 @@
+[project]
+name = "echo-channels"
+version = "0.1.0"
+description = "Channel adapters for the Chimera AI ecosystem"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9.0",
+]
+
+[project.optional-dependencies]
+slack = [
+    "slack-bolt>=1.18.0",
+    "slack-sdk>=3.27.0",
+]
+discord = [
+    "discord.py>=2.3.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
