@@ -1,7 +1,7 @@
-"""Slack adapter for JARVIS using Slack Bolt (Socket Mode).
+"""Slack adapter for JARVIS with streaming responses.
 
-Listens for messages and app mentions in Slack, forwards them to JARVIS,
-and posts the response back to the channel.
+Uses async Slack Bolt for proper concurrency. Streams JARVIS responses
+via WebSocket and edits the Slack message progressively as tokens arrive.
 
 ## Setup
 
@@ -25,23 +25,24 @@ and posts the response back to the channel.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import uuid
 
 from echo.shared.client import JarvisClient
+from echo.shared.format import to_slack
+from echo.shared.sessions import get_session, set_session
+from echo.shared.stream import JarvisStreamClient, StreamAccumulator, TERMINAL_EVENTS
 
 logger = logging.getLogger(__name__)
 
-# Session tracking: map Slack channel_id to JARVIS session_id
-_channel_sessions: dict[str, str] = {}
+PLATFORM = "slack"
 
 
 def create_slack_app():
-    """Create and configure the Slack Bolt app."""
-    from slack_bolt import App
-    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    """Create and configure the async Slack Bolt app."""
+    from slack_bolt.async_app import AsyncApp
+    from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     app_token = os.environ.get("SLACK_APP_TOKEN", "")
@@ -52,24 +53,30 @@ def create_slack_app():
     if not app_token:
         raise ValueError("SLACK_APP_TOKEN is required")
 
-    app = App(token=bot_token)
+    app = AsyncApp(token=bot_token)
     jarvis = JarvisClient()
+    stream_client = JarvisStreamClient()
 
     @app.event("message")
-    def handle_message(event, say):
-        """Handle direct messages and channel messages."""
-        _handle_event(event, say, jarvis, respond_to_bots)
+    async def handle_message(event, say, client):
+        await _handle_event(event, say, client, jarvis, stream_client, respond_to_bots)
 
     @app.event("app_mention")
-    def handle_mention(event, say):
-        """Handle @mentions of the bot."""
-        _handle_event(event, say, jarvis, respond_to_bots)
+    async def handle_mention(event, say, client):
+        await _handle_event(event, say, client, jarvis, stream_client, respond_to_bots)
 
-    return app, SocketModeHandler(app, app_token)
+    return app, AsyncSocketModeHandler(app, app_token)
 
 
-def _handle_event(event: dict, say, jarvis: JarvisClient, respond_to_bots: bool):
-    """Process a Slack event by forwarding to JARVIS."""
+async def _handle_event(
+    event: dict,
+    say,
+    client,
+    jarvis: JarvisClient,
+    stream_client: JarvisStreamClient,
+    respond_to_bots: bool,
+):
+    """Process a Slack event by streaming JARVIS response with progressive edits."""
     # Skip bot messages (unless configured otherwise)
     if event.get("bot_id") and not respond_to_bots:
         return
@@ -82,8 +89,7 @@ def _handle_event(event: dict, say, jarvis: JarvisClient, respond_to_bots: bool)
     if not text:
         return
 
-    # Strip bot mention from text (for @mentions)
-    # Slack sends "<@BOT_ID> message" — strip the mention prefix
+    # Strip bot mention from text
     if text.startswith("<@"):
         parts = text.split(">", 1)
         if len(parts) > 1:
@@ -94,63 +100,147 @@ def _handle_event(event: dict, say, jarvis: JarvisClient, respond_to_bots: bool)
     channel_id = event.get("channel", "")
     user_id = event.get("user", "")
 
-    logger.info(
-        "Slack message from %s in %s: %s",
-        user_id,
-        channel_id,
-        text[:100],
-    )
+    logger.info("Slack message from %s in %s: %s", user_id, channel_id, text[:100])
 
-    # Get or create JARVIS session for this channel
-    session_id = _channel_sessions.get(channel_id)
+    # Persistent session lookup
+    session_id = get_session(PLATFORM, channel_id)
+    idempotency_key = f"slack-{event.get('client_msg_id', uuid.uuid4().hex)}"
 
-    # Run async JARVIS call in a sync context (Slack Bolt is sync)
-    loop = asyncio.new_event_loop()
-    try:
-        response = loop.run_until_complete(
-            jarvis.chat(
+    # Post initial "thinking" message that we'll edit with streamed content
+    initial = await say("...")
+    msg_ts = initial.get("ts") if isinstance(initial, dict) else None
+
+    # Try streaming first, fall back to sync
+    streamed = False
+    if msg_ts:
+        streamed = await _stream_response(
+            client, channel_id, msg_ts,
+            jarvis, stream_client,
+            text, session_id, idempotency_key,
+        )
+
+    if not streamed:
+        # Fallback: sync request
+        try:
+            response = await jarvis.chat(
                 message=text,
                 session_id=session_id,
-                idempotency_key=f"slack-{event.get('client_msg_id', uuid.uuid4().hex)}",
-                mode="sync",
-                wait_ms=15000,
+                idempotency_key=idempotency_key,
             )
+        except Exception as exc:
+            logger.error("JARVIS call failed: %s", exc, exc_info=True)
+            if msg_ts:
+                await client.chat_update(
+                    channel=channel_id, ts=msg_ts,
+                    text="Sorry, I couldn't process that right now.",
+                )
+            else:
+                await say("Sorry, I couldn't process that right now.")
+            return
+
+        if response.session_id:
+            set_session(PLATFORM, channel_id, response.session_id)
+
+        reply = to_slack(response.text or "I processed your message but have no response.")
+        if msg_ts:
+            await client.chat_update(channel=channel_id, ts=msg_ts, text=reply)
+        else:
+            await say(reply)
+
+    logger.info("Replied in %s", channel_id)
+
+
+async def _stream_response(
+    client,
+    channel_id: str,
+    msg_ts: str,
+    jarvis: JarvisClient,
+    stream_client: JarvisStreamClient,
+    message: str,
+    session_id: str | None,
+    idempotency_key: str,
+) -> bool:
+    """Stream JARVIS response and edit the Slack message progressively.
+
+    Returns True if streaming succeeded, False to fall back to sync.
+    """
+    try:
+        # Start async turn
+        response = await jarvis.chat_async(
+            message=message,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
         )
+
+        if not response.turn_id or not response.session_id:
+            return False
+
+        set_session(PLATFORM, channel_id, response.session_id)
+        accumulator = StreamAccumulator(throttle_seconds=1.0)
+
+        async for event in stream_client.stream(response.session_id, response.turn_id):
+            if event.type == "assistant.delta" and event.delta:
+                accumulator.feed(event.delta)
+
+                if accumulator.should_flush():
+                    formatted = to_slack(accumulator.flush())
+                    try:
+                        await client.chat_update(
+                            channel=channel_id, ts=msg_ts, text=formatted,
+                        )
+                    except Exception as exc:
+                        logger.debug("Edit throttled: %s", exc)
+
+            elif event.type == "assistant.final":
+                final_text = event.text or accumulator.full_text
+                if final_text:
+                    formatted = to_slack(final_text)
+                    await client.chat_update(
+                        channel=channel_id, ts=msg_ts, text=formatted,
+                    )
+                return True
+
+            elif event.type in TERMINAL_EVENTS:
+                # Turn failed/cancelled
+                if accumulator.full_text:
+                    formatted = to_slack(accumulator.full_text)
+                    await client.chat_update(
+                        channel=channel_id, ts=msg_ts, text=formatted,
+                    )
+                else:
+                    await client.chat_update(
+                        channel=channel_id, ts=msg_ts,
+                        text="Sorry, something went wrong.",
+                    )
+                return True
+
+        # Stream ended without terminal event — use whatever we have
+        if accumulator.full_text:
+            formatted = to_slack(accumulator.full_text)
+            await client.chat_update(channel=channel_id, ts=msg_ts, text=formatted)
+            return True
+
+        return False
+
     except Exception as exc:
-        logger.error("JARVIS call failed: %s", exc)
-        say("Sorry, I couldn't process that right now.")
-        return
-    finally:
-        loop.run_until_complete(jarvis.close())
-        loop.close()
-
-    # Track session for continuity
-    if response.session_id:
-        _channel_sessions[channel_id] = response.session_id
-
-    # Send response
-    reply = response.text or "I processed your message but have no response."
-    say(reply)
-
-    logger.info(
-        "Replied in %s: %s",
-        channel_id,
-        reply[:100],
-    )
+        logger.warning("Streaming failed, falling back to sync: %s", exc, exc_info=True)
+        return False
 
 
 def main():
     """Run the Slack adapter."""
+    import asyncio
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    logger.info("Starting Echo Slack adapter...")
+    logger.info("Starting Echo Slack adapter (streaming)...")
     logger.info("JARVIS URL: %s", os.environ.get("JARVIS_URL", "http://localhost:8400"))
 
     app, handler = create_slack_app()
-    handler.start()
+    asyncio.run(handler.start_async())
 
 
 if __name__ == "__main__":

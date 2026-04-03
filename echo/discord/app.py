@@ -1,7 +1,7 @@
-"""Discord adapter for JARVIS using discord.py.
+"""Discord adapter for JARVIS with streaming responses.
 
-Listens for messages and mentions in Discord, forwards them to JARVIS,
-and posts the response back to the channel.
+Streams JARVIS responses via WebSocket and edits the Discord message
+progressively as tokens arrive. Shows typing indicator during processing.
 
 ## Setup
 
@@ -33,21 +33,25 @@ import uuid
 import discord
 
 from echo.shared.client import JarvisClient
+from echo.shared.format import to_discord
+from echo.shared.sessions import get_session, set_session
+from echo.shared.stream import JarvisStreamClient, StreamAccumulator, TERMINAL_EVENTS
 
 logger = logging.getLogger(__name__)
 
-# Session tracking: map Discord channel_id to JARVIS session_id
-_channel_sessions: dict[int, str] = {}
+PLATFORM = "discord"
+DISCORD_MAX_LENGTH = 2000
 
 
 class EchoDiscordBot(discord.Client):
-    """Discord bot that bridges messages to JARVIS."""
+    """Discord bot that bridges messages to JARVIS with streaming."""
 
-    def __init__(self, jarvis: JarvisClient, **kwargs):
+    def __init__(self, jarvis: JarvisClient, stream_client: JarvisStreamClient, **kwargs):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents, **kwargs)
         self.jarvis = jarvis
+        self.stream_client = stream_client
         self.prefix = os.environ.get("ECHO_DISCORD_PREFIX", "!jarvis ")
         self.respond_to_mentions = os.environ.get(
             "ECHO_DISCORD_RESPOND_TO_MENTIONS", "1"
@@ -57,10 +61,8 @@ class EchoDiscordBot(discord.Client):
         logger.info("Discord bot connected as %s", self.user)
 
     async def on_message(self, message: discord.Message):
-        # Don't respond to ourselves
         if message.author == self.user:
             return
-        # Don't respond to other bots
         if message.author.bot:
             return
 
@@ -69,11 +71,9 @@ class EchoDiscordBot(discord.Client):
         is_dm = isinstance(message.channel, discord.DMChannel)
         has_prefix = text.lower().startswith(self.prefix.lower())
 
-        # Respond to: DMs, @mentions, or prefix commands
         if not (is_dm or (is_mention and self.respond_to_mentions) or has_prefix):
             return
 
-        # Strip prefix or mention
         if has_prefix:
             text = text[len(self.prefix):].strip()
         elif is_mention and self.user:
@@ -84,51 +84,121 @@ class EchoDiscordBot(discord.Client):
 
         logger.info(
             "Discord message from %s in %s: %s",
-            message.author.name,
-            message.channel.id,
-            text[:100],
+            message.author.name, message.channel.id, text[:100],
         )
 
-        # Get or create JARVIS session for this channel
-        session_id = _channel_sessions.get(message.channel.id)
+        channel_id = str(message.channel.id)
+        session_id = get_session(PLATFORM, channel_id)
+        idempotency_key = f"discord-{message.id or uuid.uuid4().hex}"
 
-        # Show typing indicator while waiting for JARVIS
-        async with message.channel.typing():
-            try:
-                response = await self.jarvis.chat(
-                    message=text,
-                    session_id=session_id,
-                    idempotency_key=f"discord-{message.id or uuid.uuid4().hex}",
-                    mode="sync",
-                    wait_ms=15000,
-                )
-            except Exception as exc:
-                logger.error("JARVIS call failed: %s", exc)
-                await message.reply("Sorry, I couldn't process that right now.")
-                return
+        # Post initial "thinking" reply that we'll edit
+        reply_msg = await message.reply("...")
 
-        # Track session for continuity
-        if response.session_id:
-            _channel_sessions[message.channel.id] = response.session_id
-
-        # Send response (split if >2000 chars — Discord limit)
-        reply = response.text or "I processed your message but have no response."
-        chunks = _split_message(reply, max_length=2000)
-        for chunk in chunks:
-            await message.reply(chunk)
-
-        logger.info(
-            "Replied in %s: %s",
-            message.channel.id,
-            reply[:100],
+        # Try streaming
+        streamed = await self._stream_response(
+            reply_msg, text, session_id, idempotency_key, channel_id,
         )
+
+        if not streamed:
+            # Fallback: sync with typing indicator
+            async with message.channel.typing():
+                try:
+                    response = await self.jarvis.chat(
+                        message=text,
+                        session_id=session_id,
+                        idempotency_key=idempotency_key,
+                    )
+                except Exception as exc:
+                    logger.error("JARVIS call failed: %s", exc, exc_info=True)
+                    await reply_msg.edit(content="Sorry, I couldn't process that right now.")
+                    return
+
+                if response.session_id:
+                    set_session(PLATFORM, channel_id, response.session_id)
+
+                reply = to_discord(response.text or "I processed your message but have no response.")
+                chunks = _split_message(reply, DISCORD_MAX_LENGTH)
+
+                await reply_msg.edit(content=chunks[0])
+                for chunk in chunks[1:]:
+                    await message.reply(chunk)
+
+        logger.info("Replied in %s", channel_id)
+
+    async def _stream_response(
+        self,
+        reply_msg: discord.Message,
+        text: str,
+        session_id: str | None,
+        idempotency_key: str,
+        channel_id: str,
+    ) -> bool:
+        """Stream JARVIS response with progressive Discord message edits."""
+        try:
+            response = await self.jarvis.chat_async(
+                message=text,
+                session_id=session_id,
+                idempotency_key=idempotency_key,
+            )
+
+            if not response.turn_id or not response.session_id:
+                return False
+
+            set_session(PLATFORM, channel_id, response.session_id)
+            accumulator = StreamAccumulator(throttle_seconds=1.2)  # Discord rate limit
+
+            async for event in self.stream_client.stream(response.session_id, response.turn_id):
+                if event.type == "assistant.delta" and event.delta:
+                    accumulator.feed(event.delta)
+
+                    if accumulator.should_flush():
+                        content = to_discord(accumulator.flush())
+                        # Truncate to Discord limit for progressive updates
+                        if len(content) > DISCORD_MAX_LENGTH:
+                            content = content[:DISCORD_MAX_LENGTH - 3] + "..."
+                        try:
+                            await reply_msg.edit(content=content)
+                        except discord.HTTPException as exc:
+                            logger.debug("Edit rate limited: %s", exc)
+
+                elif event.type == "assistant.final":
+                    final_text = event.text or accumulator.full_text
+                    if final_text:
+                        formatted = to_discord(final_text)
+                        chunks = _split_message(formatted, DISCORD_MAX_LENGTH)
+                        await reply_msg.edit(content=chunks[0])
+                        for chunk in chunks[1:]:
+                            await reply_msg.channel.send(chunk)
+                    return True
+
+                elif event.type in TERMINAL_EVENTS:
+                    if accumulator.full_text:
+                        await reply_msg.edit(content=to_discord(accumulator.full_text))
+                    else:
+                        await reply_msg.edit(content="Sorry, something went wrong.")
+                    return True
+
+            if accumulator.full_text:
+                formatted = to_discord(accumulator.full_text)
+                chunks = _split_message(formatted, DISCORD_MAX_LENGTH)
+                await reply_msg.edit(content=chunks[0])
+                for chunk in chunks[1:]:
+                    await reply_msg.channel.send(chunk)
+                return True
+
+            return False
+
+        except Exception as exc:
+            logger.warning("Streaming failed, falling back to sync: %s", exc, exc_info=True)
+            return False
 
     async def close(self):
         await self.jarvis.close()
+        await self.stream_client.close()
         await super().close()
 
 
-def _split_message(text: str, max_length: int = 2000) -> list[str]:
+def _split_message(text: str, max_length: int = DISCORD_MAX_LENGTH) -> list[str]:
     """Split a message into chunks that fit Discord's character limit."""
     if len(text) <= max_length:
         return [text]
@@ -138,10 +208,8 @@ def _split_message(text: str, max_length: int = 2000) -> list[str]:
         if len(text) <= max_length:
             chunks.append(text)
             break
-        # Try to split at a newline
         split_at = text.rfind("\n", 0, max_length)
         if split_at == -1:
-            # No newline found, split at max_length
             split_at = max_length
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
@@ -160,11 +228,12 @@ def main():
     if not token:
         raise ValueError("DISCORD_BOT_TOKEN is required")
 
-    logger.info("Starting Echo Discord adapter...")
+    logger.info("Starting Echo Discord adapter (streaming)...")
     logger.info("JARVIS URL: %s", os.environ.get("JARVIS_URL", "http://localhost:8400"))
 
     jarvis = JarvisClient()
-    bot = EchoDiscordBot(jarvis=jarvis)
+    stream_client = JarvisStreamClient()
+    bot = EchoDiscordBot(jarvis=jarvis, stream_client=stream_client)
     bot.run(token)
 
 

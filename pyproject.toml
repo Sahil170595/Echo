@@ -1,6 +1,6 @@
 [project]
 name = "echo-channels"
-version = "0.1.0"
+version = "0.2.0"
 description = "Channel adapters for the Chimera AI ecosystem"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,10 @@ slack = [
 discord = [
     "discord.py>=2.3.0",
 ]
+telegram = [
+    "python-telegram-bot>=21.0",
+]
+whatsapp = []  # uses aiohttp (core dep) for Meta Cloud API webhook
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

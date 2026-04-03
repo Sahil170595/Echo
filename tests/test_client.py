@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -42,12 +41,12 @@ async def test_chat_sync_success():
 
 @pytest.mark.asyncio
 async def test_chat_error_returns_error_response():
-    """Non-200 response returns error JarvisResponse."""
+    """Non-200 non-retriable response returns error JarvisResponse."""
     client = JarvisClient(base_url="http://test:8400", device_key="test-key")
 
     mock_resp = AsyncMock()
-    mock_resp.status = 500
-    mock_resp.text = AsyncMock(return_value="Internal Server Error")
+    mock_resp.status = 400  # Not retriable
+    mock_resp.text = AsyncMock(return_value="Bad Request")
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
     mock_resp.__aexit__ = AsyncMock(return_value=False)
 
@@ -60,6 +59,43 @@ async def test_chat_error_returns_error_response():
     response = await client.chat("hello")
     assert "Error" in response.text
     assert response.status == "failed"
+
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_async_mode():
+    """chat_async sends mode=async with wait_ms=0."""
+    client = JarvisClient(base_url="http://test:8400", device_key="test-key")
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={
+        "session_id": "sess_1",
+        "turn_id": "turn_1",
+        "turn_status": "RUNNING",
+        "still_running": True,
+        "stream_url": "ws://test:8400/jarvis/stream?session_id=sess_1",
+    })
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.post = MagicMock(return_value=mock_resp)
+    mock_session.closed = False
+
+    client._session = mock_session
+
+    response = await client.chat_async("hello")
+    assert response.turn_id == "turn_1"
+    assert response.still_running is True
+    assert response.stream_url is not None
+
+    # Verify async mode was used
+    call_args = mock_session.post.call_args
+    payload = call_args[1]["json"]
+    assert payload["mode"] == "async"
+    assert payload["wait_ms"] == 0
 
     await client.close()
 
