@@ -9,6 +9,7 @@ Includes retry with exponential backoff for transient failures.
 from __future__ import annotations
 
 import asyncio
+import uuid
 import logging
 import os
 from dataclasses import dataclass
@@ -93,10 +94,11 @@ class JarvisClient:
         }
         if session_id:
             payload["session_id"] = session_id
-        if idempotency_key:
-            payload["idempotency_key"] = idempotency_key
+        # JARVIS /jarvis/chat requires idempotency_key. Adapters pass a
+        # channel-message-derived key for dedup; generate one if a caller omits it.
+        payload["idempotency_key"] = idempotency_key or uuid.uuid4().hex
 
-        url = f"{self.base_url}/jarvis/v2/chat"
+        url = f"{self.base_url}/jarvis/chat"
         last_error: Exception | None = None
 
         for attempt in range(MAX_RETRIES):
@@ -178,7 +180,7 @@ class JarvisClient:
     async def poll_turn(self, turn_id: str, timeout_seconds: float = 30) -> str | None:
         """Poll a turn until it completes or times out."""
         session = await self._get_session()
-        url = f"{self.base_url}/jarvis/v2/turns/{turn_id}"
+        url = f"{self.base_url}/jarvis/turns/{turn_id}"
         deadline = asyncio.get_event_loop().time() + timeout_seconds
 
         while asyncio.get_event_loop().time() < deadline:
@@ -203,7 +205,7 @@ class JarvisClient:
         """Check if JARVIS is healthy."""
         try:
             session = await self._get_session()
-            async with session.get(f"{self.base_url}/jarvis/v1/health") as resp:
+            async with session.get(f"{self.base_url}/jarvis/health") as resp:
                 return resp.status == 200
         except Exception:
             return False
