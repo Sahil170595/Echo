@@ -36,6 +36,30 @@ PLATFORM = "telegram"
 TELEGRAM_MAX_LENGTH = 4096
 
 
+async def _safe_edit(msg, text: str, **kwargs) -> None:
+    """Edit a Telegram message, treating the benign "message is not modified"
+    response as success.
+
+    Telegram returns ``BadRequest("message is not modified")`` when an edit's
+    content matches what's already displayed. That happens routinely here: the
+    streamed deltas already render a short reply in full, then the
+    ``assistant.final`` edit re-sends identical text. It is NOT an error — the
+    message is already correct. Treating it as one previously bubbled up, made
+    ``_stream_response`` report failure, and triggered a redundant sync-fallback
+    turn (a second JARVIS call) that then crashed on the same no-op edit. Other
+    ``BadRequest``s (e.g. HTML entity-parse errors) still propagate so callers
+    can fall back to plain text.
+    """
+    from telegram.error import BadRequest
+
+    try:
+        await msg.edit_text(text, **kwargs)
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return
+        raise
+
+
 def _parse_allowed_chats() -> set[int] | None:
     """Parse ECHO_TELEGRAM_ALLOWED_CHATS env var into a set of chat IDs."""
     raw = os.environ.get("ECHO_TELEGRAM_ALLOWED_CHATS", "").strip()
@@ -134,10 +158,10 @@ async def handle_message(update, context) -> None:
         chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
 
         try:
-            await reply_msg.edit_text(chunks[0], parse_mode="HTML")
+            await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
         except Exception:
             # If HTML parse fails, send as plain text
-            await reply_msg.edit_text(chunks[0])
+            await _safe_edit(reply_msg, chunks[0])
 
         for chunk in chunks[1:]:
             try:
@@ -190,9 +214,9 @@ async def _stream_response(
                     formatted = to_telegram(final_text)
                     chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
                     try:
-                        await reply_msg.edit_text(chunks[0], parse_mode="HTML")
+                        await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
                     except Exception:
-                        await reply_msg.edit_text(chunks[0])
+                        await _safe_edit(reply_msg, chunks[0])
                     for chunk in chunks[1:]:
                         try:
                             await reply_msg.reply_text(chunk, parse_mode="HTML")
@@ -202,18 +226,18 @@ async def _stream_response(
 
             elif event.type in TERMINAL_EVENTS:
                 if accumulator.full_text:
-                    await reply_msg.edit_text(accumulator.full_text)
+                    await _safe_edit(reply_msg, accumulator.full_text)
                 else:
-                    await reply_msg.edit_text("Sorry, something went wrong.")
+                    await _safe_edit(reply_msg, "Sorry, something went wrong.")
                 return True
 
         if accumulator.full_text:
             formatted = to_telegram(accumulator.full_text)
             chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
             try:
-                await reply_msg.edit_text(chunks[0], parse_mode="HTML")
+                await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
             except Exception:
-                await reply_msg.edit_text(chunks[0])
+                await _safe_edit(reply_msg, chunks[0])
             return True
 
         return False
