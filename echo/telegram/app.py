@@ -21,6 +21,7 @@ progressively as tokens arrive. Uses Telegram HTML formatting.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -60,6 +61,47 @@ async def _safe_edit(msg, text: str, **kwargs) -> None:
         raise
 
 
+async def _render_final(reply_msg, text: str) -> None:
+    """Render a final answer into the Telegram message.
+
+    Edits ``reply_msg`` with the HTML-formatted first chunk (falling back to
+    plain text if Telegram rejects the entities), then sends any overflow
+    chunks as follow-up messages. Central so the streaming-final, incomplete-
+    stream, and sync-fallback paths all render identically.
+    """
+    formatted = to_telegram(text)
+    chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
+    try:
+        await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
+    except Exception:
+        await _safe_edit(reply_msg, chunks[0])
+    for chunk in chunks[1:]:
+        try:
+            await reply_msg.reply_text(chunk, parse_mode="HTML")
+        except Exception:
+            await reply_msg.reply_text(chunk)
+
+
+async def _typing_keepalive(chat, interval: float = 4.0) -> None:
+    """Re-send the TYPING chat action every ``interval`` seconds until cancelled.
+
+    Telegram's typing indicator expires after ~5s. A slow turn (slow-path
+    debate, cold model) can run far longer than that with no token yet, leaving
+    the user staring at a dead ``"..."``. This keeps "typing…" alive for the
+    whole turn; the caller cancels it once the reply is rendered.
+    """
+    from telegram.constants import ChatAction
+
+    try:
+        while True:
+            await chat.send_action(ChatAction.TYPING)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # never let keepalive failure break the turn
+        logger.debug("typing keepalive stopped: %s", exc)
+
+
 def _parse_allowed_chats() -> set[int] | None:
     """Parse ECHO_TELEGRAM_ALLOWED_CHATS env var into a set of chat IDs."""
     raw = os.environ.get("ECHO_TELEGRAM_ALLOWED_CHATS", "").strip()
@@ -68,8 +110,28 @@ def _parse_allowed_chats() -> set[int] | None:
     try:
         return {int(c.strip()) for c in raw.split(",") if c.strip()}
     except ValueError:
-        logger.warning("Invalid ECHO_TELEGRAM_ALLOWED_CHATS: %s — allowing all", raw)
-        return None
+        # Fail CLOSED: the var was set (operator intended a restriction) but is
+        # malformed. Returning None would "allow all" — silently opening the bot
+        # to anyone. An empty set rejects everyone until the config is fixed.
+        logger.error(
+            "Invalid ECHO_TELEGRAM_ALLOWED_CHATS: %r — failing closed (rejecting all). "
+            "Fix the value (comma-separated numeric chat ids) or unset it to allow all.",
+            raw,
+        )
+        return set()
+
+
+def _is_authorized(context, chat_id: int) -> bool:
+    """Return True if this chat may use the bot.
+
+    ``allowed_chats is None`` means no restriction (var unset → allow all). A
+    set — including an empty one (malformed config, fail-closed) — is an
+    allowlist: only listed chats pass.
+    """
+    allowed_chats = context.bot_data.get("allowed_chats")
+    if allowed_chats is None:
+        return True
+    return chat_id in allowed_chats
 
 
 def _split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]:
@@ -109,9 +171,7 @@ async def handle_message(update, context) -> None:
     chat_id = message.chat_id
     user = message.from_user
 
-    # Access control
-    allowed_chats = context.bot_data.get("allowed_chats")
-    if allowed_chats and chat_id not in allowed_chats:
+    if not _is_authorized(context, chat_id):
         logger.info("Ignoring message from unauthorized chat %s", chat_id)
         return
 
@@ -131,45 +191,66 @@ async def handle_message(update, context) -> None:
     await message.chat.send_action(ChatAction.TYPING)
     reply_msg = await message.reply_text("...")
 
-    # Try streaming
-    streamed = await _stream_response(
-        reply_msg, jarvis, stream_client,
-        text, session_id, idempotency_key, str(chat_id),
-    )
+    # Keep "typing…" alive for the whole turn — a slow-path debate or cold model
+    # can outlast Telegram's ~5s indicator before the first token arrives.
+    keepalive = asyncio.create_task(_typing_keepalive(message.chat))
+    try:
+        streamed = await _stream_response(
+            reply_msg, jarvis, stream_client,
+            text, session_id, idempotency_key, str(chat_id),
+        )
 
-    if not streamed:
-        # Fallback: sync
-        try:
-            response = await jarvis.chat(
-                message=text,
-                session_id=session_id,
-                idempotency_key=idempotency_key,
-            )
-        except Exception as exc:
-            logger.error("JARVIS call failed: %s", exc, exc_info=True)
-            await reply_msg.edit_text("Sorry, I couldn't process that right now.")
-            return
-
-        if response.session_id:
-            set_session(PLATFORM, str(chat_id), response.session_id)
-
-        reply = response.text or "I processed your message but have no response."
-        formatted = to_telegram(reply)
-        chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
-
-        try:
-            await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
-        except Exception:
-            # If HTML parse fails, send as plain text
-            await _safe_edit(reply_msg, chunks[0])
-
-        for chunk in chunks[1:]:
+        if not streamed:
+            # Fallback: sync request/response.
             try:
-                await message.reply_text(chunk, parse_mode="HTML")
-            except Exception:
-                await message.reply_text(chunk)
+                response = await jarvis.chat(
+                    message=text,
+                    session_id=session_id,
+                    idempotency_key=idempotency_key,
+                )
+            except Exception as exc:
+                logger.error("JARVIS call failed: %s", exc, exc_info=True)
+                await _safe_edit(reply_msg, "Sorry, I couldn't process that right now.")
+                return
+
+            if response.status == "busy":
+                # JARVIS allows one active turn per session (409): the user
+                # double-texted before the previous turn finished.
+                await _safe_edit(
+                    reply_msg,
+                    "I'm still finishing your previous message — give me a moment, "
+                    "then send that again.",
+                )
+                return
+
+            if response.session_id:
+                set_session(PLATFORM, str(chat_id), response.session_id)
+
+            reply = response.text or (
+                "My language model is briefly unavailable — try again in a moment."
+            )
+            await _render_final(reply_msg, reply)
+    finally:
+        keepalive.cancel()
 
     logger.info("Replied in %s", chat_id)
+
+
+async def handle_unsupported(update, context) -> None:
+    """Reply gracefully to non-text messages (voice, photo, sticker, document).
+
+    The text handler filters these out; without this they vanish silently. We
+    don't transcribe/OCR (that's a feature, not an edge-case fix) — just tell
+    the user so they aren't left wondering.
+    """
+    message = update.message
+    if not message:
+        return
+    if not _is_authorized(context, message.chat_id):
+        return
+    await message.reply_text(
+        "I can only handle text messages right now — send me a text message."
+    )
 
 
 async def _stream_response(
@@ -211,17 +292,7 @@ async def _stream_response(
             elif event.type == "assistant.final":
                 final_text = event.text or accumulator.full_text
                 if final_text:
-                    formatted = to_telegram(final_text)
-                    chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
-                    try:
-                        await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
-                    except Exception:
-                        await _safe_edit(reply_msg, chunks[0])
-                    for chunk in chunks[1:]:
-                        try:
-                            await reply_msg.reply_text(chunk, parse_mode="HTML")
-                        except Exception:
-                            await reply_msg.reply_text(chunk)
+                    await _render_final(reply_msg, final_text)
                 return True
 
             elif event.type in TERMINAL_EVENTS:
@@ -231,13 +302,17 @@ async def _stream_response(
                     await _safe_edit(reply_msg, "Sorry, something went wrong.")
                 return True
 
+        # Stream ended without a terminal event (WS dropped or reconnects
+        # exhausted). Don't trust the partial accumulator as if it were final —
+        # poll the turn for the authoritative answer, falling back to the
+        # partial only if the poll also fails.
+        if response.turn_id:
+            final = await jarvis.poll_turn(response.turn_id)
+            if final:
+                await _render_final(reply_msg, final)
+                return True
         if accumulator.full_text:
-            formatted = to_telegram(accumulator.full_text)
-            chunks = _split_message(formatted, TELEGRAM_MAX_LENGTH)
-            try:
-                await _safe_edit(reply_msg, chunks[0], parse_mode="HTML")
-            except Exception:
-                await _safe_edit(reply_msg, chunks[0])
+            await _render_final(reply_msg, accumulator.full_text)
             return True
 
         return False
@@ -255,6 +330,9 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # httpx logs every request URL at INFO — which includes the bot token
+    # (api.telegram.org/bot<TOKEN>/...). Quiet it so the token never reaches logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not token:
@@ -274,10 +352,23 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Non-text (voice, photo, sticker, document) — reply gracefully instead of
+    # dropping it silently. Excludes service/status messages.
+    app.add_handler(
+        MessageHandler(~filters.TEXT & ~filters.StatusUpdate.ALL, handle_unsupported)
+    )
 
-    logger.info("Allowed chats: %s", allowed_chats if allowed_chats else "all")
+    logger.info(
+        "Allowed chats: %s", allowed_chats if allowed_chats is not None else "all"
+    )
 
-    app.run_polling(drop_pending_updates=True)
+    # Default to processing messages queued during downtime — don't silently
+    # lose a message because the adapter bounced. Set ECHO_TELEGRAM_DROP_PENDING=1
+    # to discard the backlog on start instead.
+    drop_pending = os.environ.get(
+        "ECHO_TELEGRAM_DROP_PENDING", "false"
+    ).strip().lower() in ("1", "true", "yes")
+    app.run_polling(drop_pending_updates=drop_pending)
 
 
 if __name__ == "__main__":

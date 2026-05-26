@@ -110,6 +110,15 @@ class JarvisClient:
 
                     body = await resp.text()
 
+                    if resp.status == 409:
+                        # JARVIS allows one active turn per session. Surface this
+                        # as a distinct "busy" status so adapters can ask the user
+                        # to wait rather than rendering a raw error string.
+                        logger.info("JARVIS busy (409): concurrent turn for this session")
+                        return JarvisResponse(
+                            session_id="", turn_id="", text=None, status="busy",
+                        )
+
                     if resp.status in RETRIABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
                         delay = RETRY_BASE_DELAY * (2 ** attempt)
                         logger.warning(
