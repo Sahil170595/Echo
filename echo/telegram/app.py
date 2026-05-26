@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 
 from echo.shared.client import JarvisClient
@@ -92,10 +93,18 @@ async def _typing_keepalive(chat, interval: float = 4.0) -> None:
     """
     from telegram.constants import ChatAction
 
+    logged = False
     try:
         while True:
             await chat.send_action(ChatAction.TYPING)
             await asyncio.sleep(interval)
+            if not logged:
+                # Fires once per turn that outlives the first interval — i.e.
+                # exactly the slow turns where the keepalive earns its keep.
+                logged = True
+                logger.info(
+                    "Slow turn (>%.0fs) — keeping the typing indicator alive", interval
+                )
     except asyncio.CancelledError:
         pass
     except Exception as exc:  # never let keepalive failure break the turn
@@ -135,7 +144,14 @@ def _is_authorized(context, chat_id: int) -> bool:
 
 
 def _split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]:
-    """Split a message into chunks that fit Telegram's character limit."""
+    """Split a message into chunks that fit Telegram's character limit.
+
+    Prefers a newline, then a space, before a hard cut — and never splits inside
+    an HTML ``<tag>`` (which would break ``parse_mode=HTML`` for that chunk).
+    Note: a formatting span crossing the boundary (e.g. an open ``<b>`` whose
+    ``</b>`` lands in the next chunk) still degrades to plain text per the
+    render fallback — fully tag-balanced splitting is out of scope.
+    """
     if len(text) <= max_length:
         return [text]
 
@@ -144,8 +160,19 @@ def _split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str
         if len(text) <= max_length:
             chunks.append(text)
             break
+        # Prefer a newline, then a space, to avoid mid-word cuts.
         split_at = text.rfind("\n", 0, max_length)
         if split_at == -1:
+            split_at = text.rfind(" ", 0, max_length)
+        if split_at == -1:
+            split_at = max_length
+        # Don't cut inside a tag: if an unclosed '<' precedes the split point,
+        # back up to before it.
+        head = text[:split_at]
+        last_open = head.rfind("<")
+        if last_open > head.rfind(">"):
+            split_at = last_open
+        if split_at <= 0:  # never stall (e.g. a tag longer than the budget)
             split_at = max_length
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
@@ -188,6 +215,7 @@ async def handle_message(update, context) -> None:
     idempotency_key = f"telegram-{message.message_id or uuid.uuid4().hex}"
 
     # Show typing and post initial "thinking" message
+    t0 = time.monotonic()
     await message.chat.send_action(ChatAction.TYPING)
     reply_msg = await message.reply_text("...")
 
@@ -233,7 +261,7 @@ async def handle_message(update, context) -> None:
     finally:
         keepalive.cancel()
 
-    logger.info("Replied in %s", chat_id)
+    logger.info("Replied in %s (%.1fs)", chat_id, time.monotonic() - t0)
 
 
 async def handle_unsupported(update, context) -> None:
@@ -241,13 +269,26 @@ async def handle_unsupported(update, context) -> None:
 
     The text handler filters these out; without this they vanish silently. We
     don't transcribe/OCR (that's a feature, not an edge-case fix) — just tell
-    the user so they aren't left wondering.
+    the user so they aren't left wondering, and log it so the path is observable.
     """
     message = update.message
     if not message:
         return
     if not _is_authorized(context, message.chat_id):
         return
+
+    kind = (
+        "photo" if message.photo else
+        "voice" if message.voice else
+        "audio" if message.audio else
+        "video" if message.video else
+        "video_note" if message.video_note else
+        "document" if message.document else
+        "sticker" if message.sticker else
+        "location" if message.location else
+        "other"
+    )
+    logger.info("Unsupported message (%s) from %s — declined", kind, message.chat_id)
     await message.reply_text(
         "I can only handle text messages right now — send me a text message."
     )
