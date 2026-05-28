@@ -140,14 +140,22 @@ class JarvisClient:
                 last_error = exc
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    # Log the failure CLASS, not str(exc): aiohttp connection
+                    # errors embed the target host:port ("Cannot connect to host
+                    # jarvis-gateway:8000 ...") and internal topology must not
+                    # leak into logs.
                     logger.warning(
-                        "JARVIS connection failed, retrying in %.1fs (attempt %d/%d): %s",
-                        delay, attempt + 1, MAX_RETRIES, exc,
+                        "JARVIS connection failed (%s), retrying in %.1fs (attempt %d/%d)",
+                        type(exc).__name__, delay, attempt + 1, MAX_RETRIES,
                     )
                     await asyncio.sleep(delay)
                     continue
 
-        logger.error("JARVIS chat failed after %d attempts: %s", MAX_RETRIES, last_error)
+        logger.error(
+            "JARVIS chat failed after %d attempts (%s)",
+            MAX_RETRIES,
+            type(last_error).__name__ if last_error else "unknown",
+        )
         return JarvisResponse(
             session_id="",
             turn_id="",

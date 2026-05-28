@@ -41,9 +41,12 @@ def test_parse_allowed_chats_valid():
 
 
 def test_parse_allowed_chats_invalid():
+    # Malformed allowlist fails CLOSED (P104.10): the var was set, so returning
+    # None ("allow all") would silently open the bot. An empty set is an
+    # allowlist that rejects everyone until the config is fixed.
     with patch.dict(os.environ, {"ECHO_TELEGRAM_ALLOWED_CHATS": "abc,def"}):
         result = _parse_allowed_chats()
-        assert result is None
+        assert result == set()
 
 
 @pytest.mark.asyncio

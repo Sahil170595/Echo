@@ -26,6 +26,7 @@ import logging
 import os
 import time
 import uuid
+from urllib.parse import urlparse
 
 from echo.shared.client import JarvisClient
 from echo.shared.format import to_telegram
@@ -380,7 +381,10 @@ def main():
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
 
     logger.info("Starting Echo Telegram adapter (streaming)...")
-    logger.info("JARVIS URL: %s", os.environ.get("JARVIS_URL", "http://localhost:8400"))
+    # Log the target host only — never the port. Internal topology (host:port)
+    # should not leak into logs (mirrors the httpx token-quieting above).
+    _ju = urlparse(os.environ.get("JARVIS_URL", "http://localhost:8400"))
+    logger.info("JARVIS host: %s://%s", _ju.scheme or "http", _ju.hostname or "?")
 
     jarvis = JarvisClient()
     stream_client = JarvisStreamClient()
